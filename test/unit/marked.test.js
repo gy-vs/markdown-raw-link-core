@@ -512,6 +512,91 @@ describe('marked unit', () => {
                     + '\n<dt><strong>Topic 2 walked</strong></dt><dd><em>Description 2 walked</em></dd></p>\n');
     });
 
+    describe('link label with extension raw tokens', () => {
+      const bracketSpan = {
+        extensions: [{
+          name: 'bracketSpan',
+          level: 'inline',
+          start(src) { return src.indexOf('%%'); },
+          tokenizer(src) {
+            const match = /^%%([\s\S]*?)%%/.exec(src);
+            if (match) {
+              return {
+                type: 'bracketSpan',
+                raw: match[0],
+                text: match[1],
+              };
+            }
+          },
+          renderer(token) {
+            return `<span>${token.text}</span>`;
+          },
+        }],
+      };
+
+      it('should find the label end after a bracket in an extension token', () => {
+        marked.use(bracketSpan);
+        assert.strictEqual(
+          marked.parse('[a %%]%% b](https://example.com)').trim(),
+          '<p><a href="https://example.com">a <span>]</span> b</a></p>',
+        );
+      });
+
+      it('should find the label end after two brackets in an extension token', () => {
+        marked.use(bracketSpan);
+        assert.strictEqual(
+          marked.parse('[a %%]]%% b](https://example.com)').trim(),
+          '<p><a href="https://example.com">a <span>]]</span> b</a></p>',
+        );
+      });
+
+      it('should skip adjacent extension tokens in the label', () => {
+        marked.use(bracketSpan);
+        assert.strictEqual(
+          marked.parse('[%%x]%%%%y]%% z](https://example.com)').trim(),
+          '<p><a href="https://example.com"><span>x]</span><span>y]</span> z</a></p>',
+        );
+      });
+
+      it('should skip extension tokens in reference link text', () => {
+        marked.use(bracketSpan);
+        assert.strictEqual(
+          marked.parse('[a %%]%% b][ref]\n\n[ref]: https://example.com "title"').trim(),
+          '<p><a href="https://example.com" title="title">a <span>]</span> b</a></p>',
+        );
+      });
+
+      it('should skip extension tokens in image text', () => {
+        marked.use(bracketSpan);
+        assert.strictEqual(
+          marked.parse('![a %%]%% b](https://example.com/img.png)').trim(),
+          '<p><img src="https://example.com/img.png" alt="a &lt;span&gt;]&lt;/span&gt; b"></p>',
+        );
+      });
+
+      it('should fall back to plain text when the candidate fails', () => {
+        marked.use(bracketSpan);
+        assert.strictEqual(
+          marked.parse('[a %%]%% b](https://example.com').trim(),
+          '<p>[a <span>]</span> b](<a href="https://example.com">https://example.com</a></p>',
+        );
+      });
+
+      it('should not change tokens outside the new link', () => {
+        marked.use(bracketSpan);
+        const tokens = marked.lexer('before [a %%]%% b](https://example.com) after');
+        const paragraph = tokens[0];
+        assert.deepStrictEqual(
+          paragraph.tokens.map(token => [token.type, token.raw]),
+          [
+            ['text', 'before '],
+            ['link', '[a %%]%% b](https://example.com)'],
+            ['text', ' after'],
+          ],
+        );
+      });
+    });
+
     describe('multiple extensions', () => {
       function createExtension(name) {
         return {

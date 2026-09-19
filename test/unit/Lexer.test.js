@@ -1789,6 +1789,153 @@ paragraph
         });
       });
 
+      describe('link label raw tokens', () => {
+        it('code span with a bracket in link text', () => {
+          expectInlineTokens({
+            md: '[`a]b`](https://example.com)',
+            tokens: [
+              {
+                type: 'link',
+                raw: '[`a]b`](https://example.com)',
+                href: 'https://example.com',
+                title: null,
+                text: '`a]b`',
+                tokens: [
+                  { type: 'codespan', raw: '`a]b`', text: 'a]b' },
+                ],
+              },
+            ],
+          });
+        });
+
+        it('code span with two brackets in link text', () => {
+          expectInlineTokens({
+            md: '[`a]]b`](https://example.com)',
+            tokens: [
+              {
+                type: 'link',
+                raw: '[`a]]b`](https://example.com)',
+                href: 'https://example.com',
+                title: null,
+                text: '`a]]b`',
+                tokens: [
+                  { type: 'codespan', raw: '`a]]b`', text: 'a]]b' },
+                ],
+              },
+            ],
+          });
+        });
+
+        it('code span with backticks and a bracket in link text', () => {
+          expectInlineTokens({
+            md: '[`x``y]z`](https://example.com)',
+            tokens: [
+              {
+                type: 'link',
+                raw: '[`x``y]z`](https://example.com)',
+                href: 'https://example.com',
+                title: null,
+                text: '`x``y]z`',
+                tokens: [
+                  { type: 'codespan', raw: '`x``y]z`', text: 'x``y]z' },
+                ],
+              },
+            ],
+          });
+        });
+
+        it('adjacent code spans in link text', () => {
+          expectInlineTokens({
+            md: '[`a]`b`c`](https://example.com)',
+            tokens: [
+              {
+                type: 'link',
+                raw: '[`a]`b`c`](https://example.com)',
+                href: 'https://example.com',
+                title: null,
+                text: '`a]`b`c`',
+                tokens: [
+                  { type: 'codespan', raw: '`a]`', text: 'a]' },
+                  { type: 'text', raw: 'b', text: 'b', escaped: false },
+                  { type: 'codespan', raw: '`c`', text: 'c' },
+                ],
+              },
+            ],
+          });
+        });
+
+        it('image with a code span bracket in the text', () => {
+          expectInlineTokens({
+            md: '![`a]b`](https://example.com/img.png)',
+            tokens: [
+              {
+                type: 'image',
+                raw: '![`a]b`](https://example.com/img.png)',
+                href: 'https://example.com/img.png',
+                title: null,
+                text: '`a]b`',
+                tokens: [
+                  { type: 'codespan', raw: '`a]b`', text: 'a]b' },
+                ],
+              },
+            ],
+          });
+        });
+
+        it('reflink with a code span bracket in link text', () => {
+          expectInlineTokens({
+            md: '[`x``y]z`][ref]',
+            links: {
+              ref: { href: 'https://example.com', title: 'title' },
+            },
+            tokens: [
+              {
+                type: 'link',
+                raw: '[`x``y]z`][ref]',
+                href: 'https://example.com',
+                title: 'title',
+                text: '`x``y]z`',
+                tokens: [
+                  { type: 'codespan', raw: '`x``y]z`', text: 'x``y]z' },
+                ],
+              },
+            ],
+          });
+        });
+
+        it('falls back to plain text when the destination never closes', () => {
+          expectInlineTokens({
+            md: '[`x``y]z`](https://example.com',
+            tokens: [
+              { type: 'text', raw: '[', text: '[' },
+              { type: 'codespan', raw: '`x``y]z`', text: 'x``y]z' },
+              { type: 'text', raw: '](', text: '](', escaped: false },
+              {
+                type: 'link',
+                raw: 'https://example.com',
+                text: 'https://example.com',
+                href: 'https://example.com',
+                autolink: true,
+                tokens: [
+                  { type: 'text', raw: 'https://example.com', text: 'https://example.com' },
+                ],
+              },
+            ],
+          });
+        });
+
+        it('falls back to plain text when the reference is undefined', () => {
+          expectInlineTokens({
+            md: '[`x``y]z`][missing]',
+            tokens: [
+              { type: 'text', raw: '[', text: '[' },
+              { type: 'codespan', raw: '`x``y]z`', text: 'x``y]z' },
+              { type: 'text', raw: '][missing]', text: '][missing]', escaped: false },
+            ],
+          });
+        });
+      });
+
       describe('reflink', () => {
         it('reflink', () => {
           expectInlineTokens({

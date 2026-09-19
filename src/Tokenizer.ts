@@ -681,8 +681,133 @@ export class _Tokenizer<ParserOutput = string, RendererOutput = string> {
     }
   }
 
+  /**
+   * The label in the link rules is matched against raw text, so a `]` inside
+   * a code span or an extension token is read as the end of the label and the
+   * link is lost. Scan the label the way the inline lexer would consume it —
+   * code spans and extension tokens are raw, escapes and nested brackets keep
+   * their meaning — and replace every raw token with placeholder text, so the
+   * link rules can be retried on text where only real syntax is visible.
+   * The masked source has the same length as `src`, so match positions map
+   * back one to one. Returns undefined when there is no label to mask.
+   */
+  private maskLinkLabel(src: string): string | undefined {
+    const labelStart = src.charAt(0) === '!' ? 2 : 1;
+    if (src.charAt(labelStart - 1) !== '[') {
+      return;
+    }
+
+    const extensions = this.options.extensions?.inline;
+    let masked = '';
+    let foundRawToken = false;
+    let depth = 0;
+    let i = labelStart;
+    let labelEnd = -1;
+
+    while (i < src.length) {
+      const char = src.charAt(i);
+
+      // extension tokens are raw: their raw length is consumed without
+      // looking at the characters inside
+      if (depth === 0 && extensions) {
+        let raw = '';
+        extensions.some((extTokenizer) => {
+          const token = extTokenizer.call({ lexer: this.lexer }, src.slice(i), []);
+          if (token && typeof token.raw === 'string' && token.raw.length > 0) {
+            raw = token.raw;
+            return true;
+          }
+          return false;
+        });
+        if (raw) {
+          masked += 'a'.repeat(raw.length);
+          foundRawToken = true;
+          i += raw.length;
+          continue;
+        }
+      }
+
+      if (char === '\\') {
+        if (i + 1 >= src.length) {
+          return;
+        }
+        masked += src.slice(i, i + 2);
+        i += 2;
+        continue;
+      }
+
+      // code spans are raw: brackets between the backticks never count
+      if (depth === 0 && char === '`') {
+        const cap = this.rules.inline.code.exec(src.slice(i));
+        if (cap) {
+          masked += 'a'.repeat(cap[0].length);
+          foundRawToken = true;
+          i += cap[0].length;
+          continue;
+        }
+        // a run of backticks right before the label end is label text, the
+        // same as the `` ``+(?=\]) `` alternative in the label rule
+        let runEnd = i + 1;
+        while (src.charAt(runEnd) === '`') {
+          runEnd++;
+        }
+        if (runEnd - i > 1 && src.charAt(runEnd) === ']') {
+          masked += src.slice(i, runEnd);
+          i = runEnd;
+          continue;
+        }
+        return;
+      }
+
+      if (char === '[') {
+        // the label rule caps nested brackets at two levels
+        if (depth >= 2) {
+          return;
+        }
+        depth++;
+        masked += char;
+        i++;
+        continue;
+      }
+
+      if (char === ']') {
+        if (depth === 0) {
+          labelEnd = i;
+          break;
+        }
+        depth--;
+        masked += char;
+        i++;
+        continue;
+      }
+
+      masked += char;
+      i++;
+    }
+
+    if (labelEnd === -1 || !foundRawToken) {
+      return;
+    }
+
+    return src.slice(0, labelStart) + masked + src.slice(labelEnd);
+  }
+
   link(src: string): Tokens.Link | Tokens.Image | undefined {
-    const cap = this.rules.inline.link.exec(src);
+    let cap = this.rules.inline.link.exec(src);
+    if (!cap) {
+      // retry with the raw tokens in the label masked out
+      const maskedSrc = this.maskLinkLabel(src);
+      if (maskedSrc !== undefined) {
+        cap = this.rules.inline.link.exec(maskedSrc);
+        if (cap) {
+          // the masked source has the same length as src, so captures map
+          // back one to one
+          const labelStart = src.charAt(0) === '!' ? 2 : 1;
+          cap[0] = src.slice(0, cap[0].length);
+          cap[1] = src.slice(labelStart, labelStart + cap[1].length);
+        }
+      }
+    }
     if (cap) {
       const trimmedUrl = cap[2].trim();
       if (!this.options.pedantic && this.rules.other.startAngleBracket.test(trimmedUrl)) {
@@ -742,13 +867,46 @@ export class _Tokenizer<ParserOutput = string, RendererOutput = string> {
     }
   }
 
+  /**
+   * Match the reflink and nolink rules against the source with the raw
+   * tokens in the label masked out (see maskLinkLabel). Captures are mapped
+   * back to the raw source, which has the same length as the masked source.
+   */
+  private execMaskedReflink(src: string): RegExpExecArray | undefined {
+    const maskedSrc = this.maskLinkLabel(src);
+    if (maskedSrc === undefined) {
+      return;
+    }
+    const cap = this.rules.inline.reflink.exec(maskedSrc)
+      || this.rules.inline.nolink.exec(maskedSrc);
+    if (cap) {
+      const labelStart = src.charAt(0) === '!' ? 2 : 1;
+      cap[0] = src.slice(0, cap[0].length);
+      cap[1] = src.slice(labelStart, labelStart + cap[1].length);
+      return cap;
+    }
+  }
+
   reflink(src: string, links: Links): Tokens.Link | Tokens.Image | Tokens.Text | undefined {
     let cap;
     if ((cap = this.rules.inline.reflink.exec(src))
       || (cap = this.rules.inline.nolink.exec(src))) {
-      const linkString = (cap[2] || cap[1]).replace(this.rules.other.multipleSpaceGlobal, ' ');
-      const link = links[normalizeLabel(linkString)];
+      let linkString = (cap[2] || cap[1]).replace(this.rules.other.multipleSpaceGlobal, ' ');
+      let link = links[normalizeLabel(linkString)];
       if (!link) {
+        // A `]` inside a code span or extension token may have ended the
+        // label early; retry with the raw tokens in the label masked out.
+        const maskedCap = this.execMaskedReflink(src);
+        if (maskedCap) {
+          linkString = (maskedCap[2] || maskedCap[1]).replace(this.rules.other.multipleSpaceGlobal, ' ');
+          link = links[normalizeLabel(linkString)];
+          if (link) {
+            const token = outputLink(maskedCap, link, maskedCap[0], this.lexer, this.rules);
+            if (token) {
+              return token;
+            }
+          }
+        }
         const text = cap[0].charAt(0);
         return {
           type: 'text',
@@ -757,6 +915,19 @@ export class _Tokenizer<ParserOutput = string, RendererOutput = string> {
         };
       }
       return outputLink(cap, link, cap[0], this.lexer, this.rules);
+    }
+
+    // Nothing matched the raw source; a raw token in the label may have
+    // hidden the label end. Only a match that resolves to a known link
+    // definition may consume input — anything else falls through to the
+    // lexer's plain text handling.
+    const maskedCap = this.execMaskedReflink(src);
+    if (maskedCap) {
+      const linkString = (maskedCap[2] || maskedCap[1]).replace(this.rules.other.multipleSpaceGlobal, ' ');
+      const link = links[normalizeLabel(linkString)];
+      if (link) {
+        return outputLink(maskedCap, link, maskedCap[0], this.lexer, this.rules);
+      }
     }
   }
 
