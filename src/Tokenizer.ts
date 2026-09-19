@@ -12,6 +12,17 @@ import type { _Lexer } from './Lexer.ts';
 import type { Links, Tokens, Token } from './Tokens.ts';
 import type { MarkedOptions } from './MarkedOptions.ts';
 
+/**
+ * A link rule match. Captures are copied back from the original source even
+ * when the rule ran against masked text. `rawRanges` lists opaque token
+ * spans (code spans and extension tokens) inside the candidate, and
+ * `matchEnd` is where the masked match ended in the source.
+ */
+type LinkRuleMatch = RegExpExecArray & {
+  rawRanges?: [number, number][];
+  matchEnd?: number;
+};
+
 function outputLink(cap: string[], link: Pick<Tokens.Link, 'href' | 'title'>, raw: string, lexer: _Lexer, rules: Rules): Tokens.Link | Tokens.Image | undefined {
   const href = link.href;
   const title = link.title || null;
@@ -682,7 +693,7 @@ export class _Tokenizer<ParserOutput = string, RendererOutput = string> {
   }
 
   link(src: string): Tokens.Link | Tokens.Image | undefined {
-    const cap = this.rules.inline.link.exec(src);
+    const cap = this.matchLinkRule(src, this.rules.inline.link);
     if (cap) {
       const trimmedUrl = cap[2].trim();
       if (!this.options.pedantic && this.rules.other.startAngleBracket.test(trimmedUrl)) {
@@ -697,8 +708,10 @@ export class _Tokenizer<ParserOutput = string, RendererOutput = string> {
           return;
         }
       } else {
-        // find closing parenthesis
-        const lastParenIndex = findClosingBracket(cap[2], '()');
+        // find closing parenthesis. Parens inside a raw token do not
+        // participate; matchLinkRule reports those ranges so depth is
+        // counted over syntax text only.
+        const lastParenIndex = this.findClosingParen(cap);
         if (lastParenIndex === -2) {
           // more open parens than closed
           return;
@@ -708,7 +721,7 @@ export class _Tokenizer<ParserOutput = string, RendererOutput = string> {
           const start = cap[0].indexOf('!') === 0 ? 5 : 4;
           const linkLen = start + cap[1].length + lastParenIndex;
           cap[2] = cap[2].substring(0, lastParenIndex);
-          cap[0] = cap[0].substring(0, linkLen).trim();
+          cap[0] = src.substring(0, linkLen).trim();
           cap[3] = '';
         }
       }
@@ -744,8 +757,8 @@ export class _Tokenizer<ParserOutput = string, RendererOutput = string> {
 
   reflink(src: string, links: Links): Tokens.Link | Tokens.Image | Tokens.Text | undefined {
     let cap;
-    if ((cap = this.rules.inline.reflink.exec(src))
-      || (cap = this.rules.inline.nolink.exec(src))) {
+    if ((cap = this.matchLinkRule(src, this.rules.inline.reflink))
+      || (cap = this.matchLinkRule(src, this.rules.inline.nolink))) {
       const linkString = (cap[2] || cap[1]).replace(this.rules.other.multipleSpaceGlobal, ' ');
       const link = links[normalizeLabel(linkString)];
       if (!link) {
@@ -999,5 +1012,330 @@ export class _Tokenizer<ParserOutput = string, RendererOutput = string> {
         escaped,
       };
     }
+  }
+
+  /**
+   * Run a link rule (inline link, reflink or collapsed/shortcut link).
+   *
+   * The label part of these regexes can only see code spans and backslash
+   * escapes as opaque text; brackets returned inside a raw token from an
+   * extension tokenizer count as label-ending brackets even though the
+   * tokenizer itself treats that whole span as one unit. That mismatch both
+   * accepts links whose label closes in the middle of a token and rejects
+   * valid links, leaving the later `]` to throw off token consumption.
+   *
+   * Re-scan the label tracking bracket depth over syntax-participating text
+   * only (escapes, code spans and extension raw tokens are skipped), then
+   * re-run the rule with raw token interiors masked, so the regex closes
+   * the label at the bracket the scanner found. Capture groups are copied
+   * back from the original source, so raw text and consumed length are
+   * unchanged on every accepted link. A candidate that does not survive the
+   * scan returns undefined and the lexer falls back to ordinary text without
+   * dropping a character.
+   */
+  private matchLinkRule(src: string, rule: RegExp): LinkRuleMatch | undefined {
+    // link rules only match from an opening bracket; everything else is a
+    // fast rejection that must not scan the source
+    const isImage = src.charCodeAt(0) === 0x21;
+    const openPos = isImage ? 1 : 0;
+    if (src.charCodeAt(openPos) !== 0x5B /* [ */) {
+      return;
+    }
+
+    const direct = rule.exec(src);
+    const hasExtension = !!this.options.extensions?.inline;
+
+    // bound the work to what the regex itself allows (labels to 999 items
+    // plus a short destination/title tail)
+    const scanEnd = Math.min(src.length, 4000);
+
+    if (!hasExtension) {
+      // code spans are opaque to the label regex already; they only matter
+      // in a matched inline link's destination, so no source-wide scan runs
+      // at every '['
+      if (direct && rule === this.rules.inline.link) {
+        const result = direct as LinkRuleMatch;
+        const ranges = this.scanDestinationRawRanges(src, result);
+        if (ranges.length > 0) {
+          result.rawRanges = ranges;
+          result.matchEnd = result[0].length;
+        }
+      }
+      return direct ?? undefined;
+    }
+
+    // an extension token can hide brackets anywhere in the candidate
+    const rawRanges = this.scanRawRanges(src, 0, scanEnd);
+    if (rawRanges.length === 0) {
+      return direct ?? undefined;
+    }
+
+    const masked = this.maskRawRanges(src, rawRanges);
+    const indicesRule = rule.flags.includes('d')
+      ? rule
+      : new RegExp(rule.source, `${rule.flags}d`);
+    const maskMatch = indicesRule.exec(masked) as
+      | (RegExpExecArray & { indices: ([number, number] | undefined)[] })
+      | null;
+    if (!maskMatch || maskMatch[1] === undefined) {
+      return;
+    }
+
+    // copy capture group text from the original source at the (unchanged)
+    // masked offsets, and carry the raw token ranges so the destination's
+    // paren scan can skip them
+    const result = this.copyMatchFromSource(src, maskMatch) as LinkRuleMatch;
+    result.rawRanges = rawRanges;
+    result.matchEnd = maskMatch.indices[0]?.[1] ?? maskMatch.index + maskMatch[0].length;
+    return result;
+  }
+
+  /**
+   * Raw token ranges (code spans) overlapping the inline link match's
+   * destination. The regex already closes the label correctly, so only the
+   * destination's paren scan needs these.
+   */
+  private scanDestinationRawRanges(src: string, match: RegExpExecArray): [number, number][] {
+    const destStart = match[0].length - match[2].length;
+    const destEnd = match[0].length;
+    if (src.indexOf('`', destStart) >= destEnd) {
+      return [];
+    }
+    const ranges: [number, number][] = [];
+    for (let i = destStart; i < destEnd; i++) {
+      const ch = src.charCodeAt(i);
+      if (ch === 0x5C /* \ */) {
+        i++;
+      } else if (ch === 0x60 /* ` */) {
+        const end = this.codespanRawEnd(src, i, destEnd + 1);
+        if (end > i) {
+          ranges.push([i, end]);
+          i = end - 1;
+        }
+      }
+    }
+    return ranges;
+  }
+
+  /** Copy capture group text from `src` at the masked match's offsets. */
+  private copyMatchFromSource(
+    src: string,
+    match: RegExpExecArray & { indices: ([number, number] | undefined)[] },
+  ): RegExpExecArray {
+    return match.map((group, i) => {
+      if (i === 0 || group === undefined) {
+        return group;
+      }
+      const range = match.indices[i];
+      return range ? src.slice(range[0], range[1]) : group;
+    }) as RegExpExecArray;
+  }
+
+  /** Replace every raw token interior with equal-length neutral text. */
+  private maskRawRanges(src: string, ranges: [number, number][]): string {
+    let masked = '';
+    let cursor = 0;
+    for (const [start, end] of ranges) {
+      masked += src.slice(cursor, start) + 'a'.repeat(end - start);
+      cursor = end;
+    }
+    return masked + src.slice(cursor);
+  }
+
+  /**
+   * Collect raw token ranges (code spans and inline extension tokens) in
+   * src.slice(start, scanEnd), scanning the text as the lexer would.
+   */
+  private scanRawRanges(src: string, start: number, scanEnd: number): [number, number][] {
+    const ranges: [number, number][] = [];
+    const hintEnds = this.extensionHintEnds(src, start, scanEnd);
+    const hasOpenExtension = hintEnds.includes(Infinity);
+    let hintIndex = 0;
+
+    for (let i = start; i < scanEnd; i++) {
+      const ch = src.charCodeAt(i);
+
+      if (hasOpenExtension || hintIndex < hintEnds.length) {
+        while (hintIndex < hintEnds.length && hintEnds[hintIndex] < i) {
+          hintIndex++;
+        }
+        if (hasOpenExtension || hintIndex < hintEnds.length) {
+          const rawEnd = this.extensionRawEnd(src, i);
+          if (rawEnd > i) {
+            ranges.push([i, rawEnd]);
+            i = rawEnd - 1;
+            while (hintIndex < hintEnds.length && hintEnds[hintIndex] < rawEnd) {
+              hintIndex++;
+            }
+            continue;
+          }
+        }
+      }
+
+      if (ch === 0x5C /* \ */ && i + 1 < src.length) {
+        i++;
+      } else if (ch === 0x60 /* ` */) {
+        const codeEnd = this.codespanRawEnd(src, i, scanEnd);
+        if (codeEnd > i) {
+          ranges.push([i, codeEnd]);
+          i = codeEnd - 1;
+        }
+      }
+    }
+    return ranges;
+  }
+
+  /**
+   * Sorted positions at or after `pos` where an inline extension with a
+   * `start` hint may begin. An extension without a hint can start anywhere,
+   * represented by `Infinity`; an empty array means no extension token can
+   * follow, so the scanner never has to probe one.
+   *
+   * The regexes themselves bound candidate length (labels to 999 items),
+   * and `scanEnd` passes that bound on: hints past it cannot affect this
+   * candidate. A small cap keeps repeated hint calls linear regardless of
+   * how many times the extension marker appears.
+   */
+  private extensionHintEnds(src: string, pos: number, scanEnd: number): number[] {
+    const ext = this.options.extensions;
+    if (!ext?.inline) {
+      return [];
+    }
+    const ends: number[] = [];
+    if (!ext.startInline) {
+      return [Infinity];
+    }
+    const MAX_HINTS = 16;
+    for (let e = 0; e < ext.inline.length; e++) {
+      const start = ext.startInline[e];
+      if (!start) {
+        // this extension has no hint, so it may begin at any position
+        ends.push(Infinity);
+        continue;
+      }
+      let cursor = pos;
+      for (let n = 0; n < MAX_HINTS; n++) {
+        const hint = start.call({ lexer: this.lexer }, src.slice(cursor));
+        if (typeof hint !== 'number' || hint < 0) {
+          break;
+        }
+        cursor += hint;
+        if (cursor > scanEnd) {
+          break;
+        }
+        ends.push(cursor);
+        if (hint === 0) {
+          cursor++; // guard against a hint that always reports 0
+        }
+      }
+    }
+    ends.sort((a, b) => a - b);
+    return ends;
+  }
+
+  /**
+   * End index of the raw token an inline extension would consume at `pos`,
+   * mirroring the order used by the lexer. The caller has already used the
+   * extensions' `start` hints to decide a token may start here; extensions
+   * without hints are probed directly, as the lexer does.
+   */
+  private extensionRawEnd(src: string, pos: number): number {
+    const ext = this.options.extensions;
+    const extensions = ext?.inline;
+    if (!extensions) {
+      return pos;
+    }
+    const slice = src.slice(pos);
+    for (let i = 0; i < extensions.length; i++) {
+      const start = ext!.startInline?.[i];
+      if (start && start.call({ lexer: this.lexer }, slice) !== 0) {
+        continue;
+      }
+      const token = extensions[i].call({ lexer: this.lexer }, slice, []);
+      if (token && token.raw) {
+        return pos + token.raw.length;
+      }
+    }
+    return pos;
+  }
+
+  /**
+   * End index of a code span beginning with the backtick run at `pos`.
+   * Matches the inline code rule's notion of a span: a run of backticks
+   * closes when followed by a run of the same length that is not part of a
+   * longer run. The search stops at `scanEnd`; a fence that only closes
+   * beyond it does not bound this link candidate.
+   */
+  private codespanRawEnd(src: string, pos: number, scanEnd: number): number {
+    let run = pos + 1;
+    while (run < src.length && src.charCodeAt(run) === 0x60) {
+      run++;
+    }
+    const fenceLen = run - pos;
+
+    let search = run;
+    while (search < scanEnd) {
+      const tick = src.indexOf('`', search);
+      if (tick === -1 || tick >= scanEnd) {
+        return pos;
+      }
+      let closeRun = tick + 1;
+      while (closeRun < src.length && src.charCodeAt(closeRun) === 0x60) {
+        closeRun++;
+      }
+      if (closeRun - tick === fenceLen && src.charCodeAt(closeRun) !== 0x60) {
+        return closeRun;
+      }
+      search = closeRun;
+    }
+    return pos;
+  }
+
+  /**
+   * Find the parenthesis that closes an inline link destination, counting
+   * depth only over syntax-participating text. Backslash escapes and raw
+   * tokens (code spans, extension tokens) are opaque. Returns the index
+   * relative to the destination capture (-1: no close needed, -2:
+   * unbalanced).
+   */
+  private findClosingParen(cap: LinkRuleMatch): number {
+    const destination = cap[2];
+    const rawRanges = cap.rawRanges;
+    if (!rawRanges || (destination.indexOf(')') === -1 && destination.indexOf('(') === -1)) {
+      return findClosingBracket(destination, '()');
+    }
+
+    // absolute start of the destination in the source
+    const destOffset = (cap.matchEnd ?? cap[0].length) - destination.length;
+    let level = 0;
+    let rangeIndex = 0;
+
+    for (let i = 0; i < destination.length; i++) {
+      const abs = destOffset + i;
+      const ch = destination.charCodeAt(i);
+
+      // inside a raw token: skip to its end
+      while (rangeIndex < rawRanges.length && rawRanges[rangeIndex][1] <= abs) {
+        rangeIndex++;
+      }
+      const range = rawRanges[rangeIndex];
+      if (range && abs >= range[0] && abs < range[1]) {
+        i += range[1] - abs - 1;
+        rangeIndex++;
+        continue;
+      }
+
+      if (ch === 0x5C /* \ */ && i + 1 < destination.length) {
+        i++;
+      } else if (ch === 0x28 /* ( */) {
+        level++;
+      } else if (ch === 0x29 /* ) */) {
+        level--;
+        if (level < 0) {
+          return i;
+        }
+      }
+    }
+    return level > 0 ? -2 : -1;
   }
 }
